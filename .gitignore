@@ -56,3 +56,6 @@ htmlcov/
 # Project specific
 config.local.toml
 .ace-tool/
+
+# Local deploy secrets
+scripts/deploy.env
