@@ -30,6 +30,7 @@ require_var() {
 #   REMOTE_PERSIST_ROOT="/opt/grok2api_persist"
 #   SSH_OPTS="-i ~/.ssh/id_rsa -p 22"
 SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+PROJECT_DIR="${PROJECT_DIR:-$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)}"
 DEPLOY_ENV_FILE="${DEPLOY_ENV_FILE:-$SCRIPT_DIR/deploy.env}"
 if [ -f "$DEPLOY_ENV_FILE" ]; then
   log "加载本地环境文件: $DEPLOY_ENV_FILE"
@@ -47,6 +48,11 @@ IMAGE_NAME="${IMAGE_NAME:-grok2api:latest}"
 CONTAINER_PREFIX="${CONTAINER_PREFIX:-grok2api}"
 SSH_OPTS="${SSH_OPTS:-}"
 
+if [ ! -f "$PROJECT_DIR/Dockerfile" ]; then
+  printf "[deploy] 未找到 Dockerfile: %s\n" "$PROJECT_DIR/Dockerfile" >&2
+  printf "[deploy] 请从仓库内运行，或设置 PROJECT_DIR 指向项目根目录。\n" >&2
+  exit 1
+fi
 require_var REMOTE_HOST
 require_var REMOTE_NGINX_SITE
 require_cmd ssh
@@ -76,21 +82,12 @@ sync_with_rsync() {
     --exclude '.python-version' \
     --exclude 'logs/*' \
     --exclude 'data/*' \
-    ./ "${REMOTE_HOST}:${REMOTE_APP_DIR}/"
+    "$PROJECT_DIR/" "${REMOTE_HOST}:${REMOTE_APP_DIR}/"
 }
 
 sync_with_tar() {
   log "远程缺少 rsync，回退为 tar 流式同步"
-  tar -cf - \
-    --exclude='.git' \
-    --exclude='.github' \
-    --exclude='.venv' \
-    --exclude='__pycache__' \
-    --exclude='*.pyc' \
-    --exclude='.python-version' \
-    --exclude='logs/*' \
-    --exclude='data/*' \
-    . | ssh_remote "mkdir -p '$REMOTE_APP_DIR' && tar -xf - -C '$REMOTE_APP_DIR'"
+  ( cd "$PROJECT_DIR" && tar -cf - --exclude='.git' --exclude='.github' --exclude='.venv' --exclude='__pycache__' --exclude='*.pyc' --exclude='.python-version' --exclude='logs/*' --exclude='data/*' . ) | ssh_remote "mkdir -p '$REMOTE_APP_DIR' && tar -xf - -C '$REMOTE_APP_DIR'"
 }
 
 if command -v rsync >/dev/null 2>&1 && ssh_remote "command -v rsync >/dev/null 2>&1"; then
