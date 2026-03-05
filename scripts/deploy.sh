@@ -23,13 +23,14 @@ require_var() {
 }
 
 # 关键信息建议保存在本地环境文件，不提交到仓库。
-# 示例文件（本地）：~/.config/grok2api/deploy.env
+# 示例文件（本地）：scripts/deploy.env
 #   REMOTE_HOST="root@example.com"
 #   REMOTE_NGINX_SITE="/etc/nginx/sites-enabled/example.conf"
 #   REMOTE_APP_DIR="/opt/grok2api"
 #   REMOTE_PERSIST_ROOT="/opt/grok2api_persist"
 #   SSH_OPTS="-i ~/.ssh/id_rsa -p 22"
-DEPLOY_ENV_FILE="${DEPLOY_ENV_FILE:-$HOME/.config/grok2api/deploy.env}"
+SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+DEPLOY_ENV_FILE="${DEPLOY_ENV_FILE:-$SCRIPT_DIR/deploy.env}"
 if [ -f "$DEPLOY_ENV_FILE" ]; then
   log "加载本地环境文件: $DEPLOY_ENV_FILE"
   set -a
