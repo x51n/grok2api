@@ -298,7 +298,21 @@ async def create_image(request: ImageGenerationRequest):
             headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
         )
 
-    data = [{response_field: img} for img in result.data]
+    data = []
+    for img in result.data:
+        if isinstance(img, dict):
+            item = {}
+            if response_field in img:
+                item[response_field] = img.get(response_field)
+            else:
+                fallback = img.get("b64_json") or img.get("base64") or img.get("url")
+                item[response_field] = fallback if fallback is not None else img
+            video_seed = img.get("video_seed")
+            if isinstance(video_seed, dict):
+                item["video_seed"] = video_seed
+            data.append(item)
+        else:
+            data.append({response_field: img})
     usage = result.usage_override or {
         "total_tokens": 0,
         "input_tokens": 0,

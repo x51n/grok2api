@@ -12,16 +12,20 @@ from fastapi import APIRouter
 from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel, Field
 import orjson
+from curl_cffi.requests import AsyncSession
 
 from app.services.grok.services.chat import ChatService
 from app.services.grok.services.image import ImageGenerationService
 from app.services.grok.services.image_edit import ImageEditService
 from app.services.grok.services.model import ModelService
 from app.services.grok.services.video import VideoService
+from app.services.reverse.video_upscale import VideoUpscaleReverse
+from app.services.grok.utils.download import DownloadService
 from app.services.grok.utils.response import make_chat_response
-from app.services.token import get_token_manager
+from app.services.token import get_token_manager, EffortType
 from app.core.config import get_config
 from app.core.exceptions import ValidationException, AppException, ErrorType
+from app.core.logger import logger
 
 
 class MessageItem(BaseModel):
@@ -41,6 +45,10 @@ class VideoConfig(BaseModel):
     video_length: Optional[int] = Field(6, description="视频时长(秒): 6 / 10 / 15")
     resolution_name: Optional[str] = Field("480p", description="视频分辨率: 480p, 720p")
     preset: Optional[str] = Field("custom", description="风格预设: fun, normal, spicy")
+    video_seed: Optional[Dict[str, Any]] = Field(
+        None,
+        description="图生视频种子参数（来自图片接口返回的 video_seed）",
+    )
 
       
 class ImageConfig(BaseModel):
@@ -68,6 +76,14 @@ class ChatCompletionRequest(BaseModel):
     tools: Optional[List[Dict[str, Any]]] = Field(None, description="Tool definitions")
     tool_choice: Optional[Union[str, Dict[str, Any]]] = Field(None, description="Tool choice: auto/required/none/specific")
     parallel_tool_calls: Optional[bool] = Field(True, description="Allow parallel tool calls")
+
+
+class VideoUpscaleRequest(BaseModel):
+    """视频超分请求"""
+
+    video_id: str = Field(..., description="视频 ID")
+    model: str = Field("grok-imagine-1.0-video", description="模型名称")
+    stream: bool = Field(False, description="是否流式输出 (暂不支持)")
 
 
 VALID_ROLES = {"developer", "system", "user", "assistant", "tool"}
@@ -262,6 +278,48 @@ def _validate_image_config(image_conf: ImageConfig, *, stream: bool):
             param="image_config.size",
             code="invalid_size",
         )
+
+
+async def _rewrite_upscale_urls_for_client(payload: Any, token: str) -> Any:
+    """将超分返回中的 assets URL 转为本地可访问链接（若开启 app.app_url）。"""
+    app_url = get_config("app.app_url")
+    if not app_url:
+        return payload
+
+    dl = DownloadService()
+
+    async def _walk(node: Any, key_hint: str = "") -> Any:
+        if isinstance(node, dict):
+            for k, v in list(node.items()):
+                node[k] = await _walk(v, k)
+            return node
+        if isinstance(node, list):
+            for i, item in enumerate(node):
+                node[i] = await _walk(item, key_hint)
+            return node
+        if isinstance(node, str) and node.startswith("http"):
+            key = (key_hint or "").lower()
+            host_match = "assets.grok.com" in node
+            if host_match and any(x in key for x in ("video", "media", "hd")):
+                try:
+                    return await dl.resolve_url(node, token, "video")
+                except Exception as e:
+                    logger.warning(f"Rewrite video URL failed: {e}")
+                    return node
+            if host_match and "thumbnail" in key:
+                try:
+                    return await dl.resolve_url(node, token, "image")
+                except Exception as e:
+                    logger.warning(f"Rewrite thumbnail URL failed: {e}")
+                    return node
+        return node
+
+    try:
+        return await _walk(payload)
+    finally:
+        await dl.close()
+
+
 def validate_request(request: ChatCompletionRequest):
     """验证请求参数"""
     # 验证模型
@@ -671,6 +729,24 @@ def validate_request(request: ChatCompletionRequest):
                 param="video_config.preset",
                 code="invalid_preset",
             )
+        if config.video_seed is not None:
+            if not isinstance(config.video_seed, dict):
+                raise ValidationException(
+                    message="video_seed must be an object",
+                    param="video_config.video_seed",
+                    code="invalid_video_seed",
+                )
+            parent_post_id = str(config.video_seed.get("parent_post_id") or "")
+            image_url_upstream = str(config.video_seed.get("image_url_upstream") or "")
+            if not parent_post_id and not image_url_upstream:
+                raise ValidationException(
+                    message=(
+                        "video_seed.parent_post_id "
+                        "or image_url_upstream is required"
+                    ),
+                    param="video_config.video_seed",
+                    code="invalid_video_seed",
+                )
         request.video_config = config
 
 
@@ -680,7 +756,6 @@ router = APIRouter(tags=["Chat"])
 @router.post("/chat/completions")
 async def chat_completions(request: ChatCompletionRequest):
     """Chat Completions API - 兼容 OpenAI"""
-    from app.core.logger import logger
 
     # 参数验证
     validate_request(request)
@@ -826,6 +901,7 @@ async def chat_completions(request: ChatCompletionRequest):
                 video_length=v_conf.video_length,
                 resolution=v_conf.resolution_name,
                 preset=v_conf.preset,
+                video_seed=v_conf.video_seed,
             )
         except Exception as e:
             if request.stream is not False:
@@ -856,6 +932,60 @@ async def chat_completions(request: ChatCompletionRequest):
             _safe_sse_stream(result),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+        )
+
+
+@router.post("/video/upscale")
+async def upscale_video(request: VideoUpscaleRequest):
+    """
+    视频超分接口
+
+    直接调用 Grok 的 upscale 接口对指定视频 ID 进行高清放大。
+    """
+    token_mgr = await get_token_manager()
+    await token_mgr.reload_if_stale()
+
+    token = None
+    for pool_name in ModelService.pool_candidates_for_model(request.model):
+        token = token_mgr.get_token(pool_name)
+        if token:
+            break
+
+    if not token:
+        raise AppException(
+            message="No available tokens. Please try again later.",
+            error_type=ErrorType.RATE_LIMIT.value,
+            code="rate_limit_exceeded",
+            status_code=429,
+        )
+
+    try:
+        logger.info(f"Starting upscale for video {request.video_id}")
+        async with AsyncSession() as session:
+            response = await VideoUpscaleReverse.request(session, token, request.video_id)
+        payload = response.json() if response is not None else {}
+        payload = await _rewrite_upscale_urls_for_client(payload, token)
+
+        try:
+            model_info = ModelService.get(request.model)
+            effort = (
+                EffortType.HIGH
+                if (model_info and model_info.cost.value == "high")
+                else EffortType.LOW
+            )
+            await token_mgr.consume(token, effort)
+        except Exception as e:
+            logger.warning(f"Failed to record upscale usage: {e}")
+
+        return JSONResponse(content=payload)
+    except AppException:
+        raise
+    except Exception as e:
+        logger.error(f"Upscale failed: {e}")
+        raise AppException(
+            message=f"Upscale failed: {str(e)}",
+            error_type=ErrorType.SERVER.value,
+            code="upscale_error",
         )
 
 

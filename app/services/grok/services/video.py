@@ -5,7 +5,8 @@ Grok video generation service.
 import asyncio
 import uuid
 import re
-from typing import Any, AsyncGenerator, AsyncIterable, Optional
+import time
+from typing import Any, AsyncGenerator, AsyncIterable, Dict, Optional
 
 import orjson
 from curl_cffi.requests.errors import RequestsError
@@ -37,6 +38,10 @@ from app.services.token.manager import BASIC_POOL_NAME
 
 _VIDEO_SEMAPHORE = None
 _VIDEO_SEM_VALUE = 0
+_SEED_IMAGE_POST_CACHE: Dict[str, Dict[str, Any]] = {}
+_SEED_IMAGE_POST_CACHE_LOCK = asyncio.Lock()
+_SEED_IMAGE_POST_KEY_LOCKS: Dict[str, asyncio.Lock] = {}
+_SEED_IMAGE_POST_KEY_LOCKS_LOCK = asyncio.Lock()
 
 def _get_video_semaphore() -> asyncio.Semaphore:
     """Reverse 接口并发控制（video 服务）。"""
@@ -104,6 +109,101 @@ class VideoService:
         return await self.create_post(
             token, prompt="", media_type="MEDIA_POST_TYPE_IMAGE", media_url=image_url
         )
+
+    @staticmethod
+    def _seed_cache_ttl_seconds() -> float:
+        try:
+            return max(
+                1.0, float(get_config("image.video_seed_post_cache_ttl", 24 * 3600))
+            )
+        except Exception:
+            return 24 * 3600.0
+
+    @staticmethod
+    def _seed_cache_max_entries() -> int:
+        try:
+            return max(100, int(get_config("image.video_seed_post_cache_max", 5000)))
+        except Exception:
+            return 5000
+
+    @classmethod
+    async def _get_seed_image_key_lock(cls, image_url: str) -> asyncio.Lock:
+        async with _SEED_IMAGE_POST_KEY_LOCKS_LOCK:
+            lock = _SEED_IMAGE_POST_KEY_LOCKS.get(image_url)
+            if lock is None:
+                lock = asyncio.Lock()
+                _SEED_IMAGE_POST_KEY_LOCKS[image_url] = lock
+            return lock
+
+    @classmethod
+    async def _prune_seed_cache_locked(cls) -> None:
+        now = time.time()
+
+        expired_keys = [
+            key
+            for key, info in _SEED_IMAGE_POST_CACHE.items()
+            if float(info.get("expires_at") or 0) <= now
+        ]
+        for key in expired_keys:
+            _SEED_IMAGE_POST_CACHE.pop(key, None)
+
+        max_entries = cls._seed_cache_max_entries()
+        while len(_SEED_IMAGE_POST_CACHE) > max_entries:
+            oldest_key = next(iter(_SEED_IMAGE_POST_CACHE), None)
+            if not oldest_key:
+                break
+            _SEED_IMAGE_POST_CACHE.pop(oldest_key, None)
+
+    @classmethod
+    async def _get_cached_post_id_for_seed_image(cls, image_url: str) -> str:
+        if not image_url:
+            return ""
+
+        async with _SEED_IMAGE_POST_CACHE_LOCK:
+            await cls._prune_seed_cache_locked()
+            info = _SEED_IMAGE_POST_CACHE.get(image_url)
+            if not info:
+                return ""
+
+            post_id = str(info.get("post_id") or "")
+            if not post_id:
+                _SEED_IMAGE_POST_CACHE.pop(image_url, None)
+                return ""
+
+            _SEED_IMAGE_POST_CACHE.pop(image_url, None)
+            _SEED_IMAGE_POST_CACHE[image_url] = info
+            return post_id
+
+    @classmethod
+    async def _cache_seed_image_post_id(cls, image_url: str, post_id: str) -> None:
+        if not image_url or not post_id:
+            return
+
+        ttl = cls._seed_cache_ttl_seconds()
+        async with _SEED_IMAGE_POST_CACHE_LOCK:
+            _SEED_IMAGE_POST_CACHE.pop(image_url, None)
+            _SEED_IMAGE_POST_CACHE[image_url] = {
+                "post_id": post_id,
+                "expires_at": time.time() + ttl,
+            }
+            await cls._prune_seed_cache_locked()
+
+    async def _get_or_create_seed_image_post_id(
+        self, token: str, image_url: str
+    ) -> tuple[str, bool]:
+        cached_post_id = await self._get_cached_post_id_for_seed_image(image_url)
+        if cached_post_id:
+            return cached_post_id, True
+
+        key_lock = await self._get_seed_image_key_lock(image_url)
+        async with key_lock:
+            cached_post_id = await self._get_cached_post_id_for_seed_image(image_url)
+            if cached_post_id:
+                return cached_post_id, True
+
+            post_id = await self.create_image_post(token, image_url)
+            await self._cache_seed_image_post_id(image_url, post_id)
+            return post_id, False
 
     async def generate(
         self,
@@ -224,6 +324,67 @@ class VideoService:
 
         return _stream()
 
+    async def generate_from_parent_post(
+        self,
+        token: str,
+        prompt: str,
+        parent_post_id: str,
+        image_url: str = "",
+        aspect_ratio: str = "3:2",
+        video_length: int = 6,
+        resolution: str = "480p",
+        preset: str = "normal",
+    ) -> AsyncGenerator[bytes, None]:
+        """Generate video from an existing image parent post."""
+        logger.info(
+            f"Image to video (direct): parent_post_id={parent_post_id}, "
+            f"image={(image_url[:80] if image_url else '')}"
+        )
+        mode_map = {
+            "fun": "--mode=extremely-crazy",
+            "normal": "--mode=normal",
+            "spicy": "--mode=extremely-spicy-or-crazy",
+        }
+        mode_flag = mode_map.get(preset, "--mode=custom")
+        message = f"{prompt} {mode_flag}"
+        model_config_override = {
+            "modelMap": {
+                "videoGenModelConfig": {
+                    "aspectRatio": aspect_ratio,
+                    "parentPostId": parent_post_id,
+                    "resolutionName": resolution,
+                    "videoLength": video_length,
+                }
+            }
+        }
+
+        async def _stream():
+            session = _new_session()
+            try:
+                async with _get_video_semaphore():
+                    stream_response = await AppChatReverse.request(
+                        session,
+                        token,
+                        message=message,
+                        model="grok-3",
+                        tool_overrides={"videoGen": True},
+                        model_config_override=model_config_override,
+                    )
+                    logger.info(f"Video generation started: post_id={parent_post_id}")
+                    async for line in stream_response:
+                        yield line
+            except Exception as e:
+                try:
+                    await session.close()
+                except Exception:
+                    pass
+                logger.error(f"Video generation error: {e}")
+                if isinstance(e, AppException):
+                    raise
+                raise UpstreamException(f"Video generation error: {str(e)}")
+
+        return _stream()
+
     @staticmethod
     async def completions(
         model: str,
@@ -234,6 +395,7 @@ class VideoService:
         video_length: int = 6,
         resolution: str = "480p",
         preset: str = "normal",
+        video_seed: Optional[Dict[str, Any]] = None,
     ):
         """Video generation entrypoint."""
         # Get token via intelligent routing.
@@ -282,9 +444,15 @@ class VideoService:
             should_upscale = resolution == "720p" and pool_name == BASIC_POOL_NAME
 
             try:
+                seed_parent_post_id = ""
+                seed_image_url = ""
+                if isinstance(video_seed, dict):
+                    seed_parent_post_id = str(video_seed.get("parent_post_id") or "")
+                    seed_image_url = str(video_seed.get("image_url_upstream") or "")
+
                 # Handle image attachments.
                 image_url = None
-                if image_attachments:
+                if image_attachments and not (seed_parent_post_id or seed_image_url):
                     upload_service = UploadService()
                     try:
                         if len(image_attachments) > 1:
@@ -302,7 +470,36 @@ class VideoService:
 
                 # Generate video.
                 service = VideoService()
-                if image_url:
+                if seed_parent_post_id:
+                    response = await service.generate_from_parent_post(
+                        token,
+                        prompt,
+                        parent_post_id=seed_parent_post_id,
+                        image_url=seed_image_url,
+                        aspect_ratio=aspect_ratio,
+                        video_length=video_length,
+                        resolution=resolution,
+                        preset=preset,
+                    )
+                elif seed_image_url:
+                    post_id, from_cache = await service._get_or_create_seed_image_post_id(
+                        token, seed_image_url
+                    )
+                    logger.info(
+                        f"Image to video (seed): image={seed_image_url[:80]}, "
+                        f"cached_post={'yes' if from_cache else 'no'}, post_id={post_id}"
+                    )
+                    response = await service.generate_from_parent_post(
+                        token,
+                        prompt,
+                        parent_post_id=post_id,
+                        image_url=seed_image_url,
+                        aspect_ratio=aspect_ratio,
+                        video_length=video_length,
+                        resolution=resolution,
+                        preset=preset,
+                    )
+                elif image_url:
                     response = await service.generate_from_image(
                         token,
                         prompt,
@@ -619,6 +816,8 @@ class VideoCollectProcessor(BaseProcessor):
         """Process and collect video response."""
         response_id = ""
         content = ""
+        saw_line = False
+        saw_video_resp = False
         idle_timeout = get_config("video.stream_timeout")
 
         try:
@@ -626,6 +825,7 @@ class VideoCollectProcessor(BaseProcessor):
                 line = _normalize_line(line)
                 if not line:
                     continue
+                saw_line = True
                 try:
                     data = orjson.loads(line)
                 except orjson.JSONDecodeError:
@@ -634,6 +834,7 @@ class VideoCollectProcessor(BaseProcessor):
                 resp = data.get("result", {}).get("response", {})
 
                 if video_resp := resp.get("streamingVideoGenerationResponse"):
+                    saw_video_resp = True
                     if video_resp.get("progress") == 100:
                         response_id = resp.get("responseId", "")
                         video_url = video_resp.get("videoUrl", "")
@@ -673,6 +874,17 @@ class VideoCollectProcessor(BaseProcessor):
             )
         finally:
             await self.close()
+
+        if not content:
+            logger.warning(
+                "Video collect completed without video content",
+                extra={
+                    "model": self.model,
+                    "response_id": response_id,
+                    "saw_line": saw_line,
+                    "saw_video_resp": saw_video_resp,
+                },
+            )
 
         return {
             "id": response_id,

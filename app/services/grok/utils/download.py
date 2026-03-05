@@ -58,6 +58,9 @@ class DownloadService:
         path = path_or_url
         if path_or_url.startswith("http"):
             parsed = urlparse(path_or_url)
+            host = (parsed.netloc or "").lower()
+            if host and "assets.grok.com" not in host:
+                return path_or_url
             path = parsed.path or ""
             asset_url = path_or_url
         else:

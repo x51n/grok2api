@@ -5,6 +5,7 @@ Grok image services.
 import asyncio
 import base64
 import math
+import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -30,7 +31,7 @@ image_service = ImagineWebSocketReverse()
 @dataclass
 class ImageGenerationResult:
     stream: bool
-    data: Union[AsyncGenerator[str, None], List[str]]
+    data: Union[AsyncGenerator[str, None], List[Any]]
     usage_override: Optional[dict] = None
 
 
@@ -158,6 +159,7 @@ class ImageGenerationService:
                     response_format=response_format,
                     aspect_ratio=aspect_ratio,
                     enable_nsfw=enable_nsfw,
+                    chat_format=chat_format,
                 )
             except UpstreamException as e:
                 last_error = e
@@ -211,6 +213,7 @@ class ImageGenerationService:
             n=n,
             response_format=response_format,
             size=size,
+            aspect_ratio=aspect_ratio,
             chat_format=chat_format,
         )
         stream = wrap_stream_with_usage(
@@ -233,10 +236,11 @@ class ImageGenerationService:
         response_format: str,
         aspect_ratio: str,
         enable_nsfw: Optional[bool] = None,
+        chat_format: bool = False,
     ) -> ImageGenerationResult:
         if enable_nsfw is None:
             enable_nsfw = bool(get_config("image.nsfw"))
-        all_images: List[str] = []
+        all_images: List[Any] = []
         seen = set()
         expected_per_call = 6
         calls_needed = max(1, int(math.ceil(n / expected_per_call)))
@@ -258,8 +262,11 @@ class ImageGenerationService:
                 token,
                 n=call_target,
                 response_format=response_format,
+                aspect_ratio=aspect_ratio,
             )
-            return await processor.process(upstream)
+            if chat_format:
+                return await processor.process(upstream)
+            return await processor.process_with_meta(upstream)
 
         tasks = []
         for i in range(calls_needed):
@@ -273,8 +280,24 @@ class ImageGenerationService:
                 logger.warning(f"WS batch failed: {batch}")
                 continue
             for img in batch:
-                if img not in seen:
-                    seen.add(img)
+                image_key = ""
+                if isinstance(img, dict):
+                    seed = img.get("video_seed")
+                    if isinstance(seed, dict):
+                        image_key = str(
+                            seed.get("image_id")
+                            or seed.get("image_url_upstream")
+                            or img.get(response_format)
+                            or ""
+                        )
+                    else:
+                        image_key = str(img.get(response_format) or "")
+                else:
+                    image_key = str(img or "")
+                if not image_key:
+                    image_key = str(img)
+                if image_key not in seen:
+                    seen.add(image_key)
                     all_images.append(img)
                 if len(all_images) >= n:
                     break
@@ -384,7 +407,7 @@ class ImageGenerationService:
         )
 
     @staticmethod
-    def _select_images(images: List[str], n: int) -> List[str]:
+    def _select_images(images: List[Any], n: int) -> List[Any]:
         if len(images) >= n:
             return images[:n]
         selected = images.copy()
@@ -396,7 +419,21 @@ class ImageGenerationService:
 class ImageWSBaseProcessor(BaseProcessor):
     """WebSocket image processor base."""
 
-    def __init__(self, model: str, token: str = "", response_format: str = "b64_json"):
+    _PARENT_POST_PATTERNS = (
+        re.compile(r"/generated/([0-9a-fA-F-]{36})/"),
+        re.compile(r"/users/[^/]+/([0-9a-fA-F-]{36})/content"),
+    )
+
+    def __init__(
+        self,
+        model: str,
+        token: str = "",
+        response_format: str = "b64_json",
+        aspect_ratio: str = "2:3",
+        video_length: int = 6,
+        resolution_name: str = "480p",
+        preset: str = "custom",
+    ):
         if response_format == "base64":
             response_format = "b64_json"
         super().__init__(model, token)
@@ -407,6 +444,10 @@ class ImageWSBaseProcessor(BaseProcessor):
             self.response_field = "base64"
         else:
             self.response_field = "b64_json"
+        self.aspect_ratio = aspect_ratio
+        self.video_length = int(video_length or 6)
+        self.resolution_name = resolution_name or "480p"
+        self.preset = preset or "custom"
         self._image_dir: Optional[Path] = None
 
     def _ensure_image_dir(self) -> Path:
@@ -499,6 +540,35 @@ class ImageWSBaseProcessor(BaseProcessor):
             logger.warning(f"Image output failed: {e}")
             return ""
 
+    @classmethod
+    def _extract_parent_post_id(cls, image_url_upstream: str) -> str:
+        raw = str(image_url_upstream or "")
+        if not raw:
+            return ""
+        for pattern in cls._PARENT_POST_PATTERNS:
+            match = pattern.search(raw)
+            if match:
+                return str(match.group(1))
+        return ""
+
+    def _build_video_seed(self, item: Dict[str, Any]) -> Dict[str, Any]:
+        image_id = str(item.get("image_id") or "")
+        image_url_upstream = str(item.get("url") or "")
+        parent_post_id = self._extract_parent_post_id(image_url_upstream)
+        seed: Dict[str, Any] = {
+            "image_id": image_id,
+            "image_url_upstream": image_url_upstream,
+            "video_defaults": {
+                "aspectRatio": self.aspect_ratio,
+                "videoLength": self.video_length,
+                "resolutionName": self.resolution_name,
+                "preset": self.preset,
+            },
+        }
+        if parent_post_id:
+            seed["parent_post_id"] = parent_post_id
+        return seed
+
 
 class ImageWSStreamProcessor(ImageWSBaseProcessor):
     """WebSocket image stream processor."""
@@ -510,9 +580,21 @@ class ImageWSStreamProcessor(ImageWSBaseProcessor):
         n: int = 1,
         response_format: str = "b64_json",
         size: str = "1024x1024",
+        aspect_ratio: str = "2:3",
+        video_length: int = 6,
+        resolution_name: str = "480p",
+        preset: str = "custom",
         chat_format: bool = False,
     ):
-        super().__init__(model, token, response_format)
+        super().__init__(
+            model,
+            token,
+            response_format,
+            aspect_ratio=aspect_ratio,
+            video_length=video_length,
+            resolution_name=resolution_name,
+            preset=preset,
+        )
         self.n = n
         self.size = size
         self.chat_format = chat_format
@@ -719,6 +801,7 @@ class ImageWSStreamProcessor(ImageWSBaseProcessor):
                     {
                         "type": "image_generation.completed",
                         self.response_field: output,
+                        "video_seed": self._build_video_seed(item),
                         "created_at": int(time.time()),
                         "size": self.size,
                         "index": index,
@@ -755,12 +838,28 @@ class ImageWSCollectProcessor(ImageWSBaseProcessor):
     """WebSocket image non-stream processor."""
 
     def __init__(
-        self, model: str, token: str = "", n: int = 1, response_format: str = "b64_json"
+        self,
+        model: str,
+        token: str = "",
+        n: int = 1,
+        response_format: str = "b64_json",
+        aspect_ratio: str = "2:3",
+        video_length: int = 6,
+        resolution_name: str = "480p",
+        preset: str = "custom",
     ):
-        super().__init__(model, token, response_format)
+        super().__init__(
+            model,
+            token,
+            response_format,
+            aspect_ratio=aspect_ratio,
+            video_length=video_length,
+            resolution_name=resolution_name,
+            preset=preset,
+        )
         self.n = n
 
-    async def process(self, response: AsyncIterable[dict]) -> List[str]:
+    async def _collect_selected(self, response: AsyncIterable[dict]) -> List[Dict[str, Any]]:
         images: Dict[str, Dict] = {}
 
         async for item in response:
@@ -781,6 +880,10 @@ class ImageWSCollectProcessor(ImageWSBaseProcessor):
         )
         if self.n:
             selected = selected[: self.n]
+        return selected
+
+    async def process(self, response: AsyncIterable[dict]) -> List[str]:
+        selected = await self._collect_selected(response)
 
         results: List[str] = []
         for item in selected:
@@ -788,6 +891,21 @@ class ImageWSCollectProcessor(ImageWSBaseProcessor):
             if output:
                 results.append(output)
 
+        return results
+
+    async def process_with_meta(self, response: AsyncIterable[dict]) -> List[Dict[str, Any]]:
+        selected = await self._collect_selected(response)
+        results: List[Dict[str, Any]] = []
+        for item in selected:
+            output = await self._to_output(item.get("image_id", ""), item)
+            if not output:
+                continue
+            results.append(
+                {
+                    self.response_field: output,
+                    "video_seed": self._build_video_seed(item),
+                }
+            )
         return results
 
 
