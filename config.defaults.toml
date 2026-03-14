@@ -6,10 +6,10 @@ app_url = ""
 app_key = "grok2api"
 # API 调用密钥（可选，支持列表）
 api_key = ""
-# 是否启用 public 功能玩法
-public_enabled = false
-# Public 调用密钥（可选）
-public_key = ""
+# 是否启用 function 功能玩法
+function_enabled = false
+# function 调用密钥（可选）
+function_key = ""
 # 生成图片的格式（url 或 base64）
 image_format = "url"
 # 生成视频的格式（html 或 url）
@@ -148,6 +148,15 @@ concurrent = 100
 timeout = 60
 # 流式空闲超时时间（秒）
 stream_timeout = 60
+# Basic 号池视频超分模式
+# single: 单次扩展完成后超分（速度更慢，效果更好）
+# complete: 所有扩展完成后超分（速度更快，效果更差）
+upscale_timing = "complete"
+
+# ==================== 视频种子配置 ====================
+[video_seed]
+# video_seed 持久化保留天数
+retention_days = 30
 
 # ==================== 语音配置 ====================
 [voice]

@@ -21,6 +21,7 @@ from app.services.grok.utils.process import BaseProcessor
 from app.services.grok.utils.retry import pick_token, rate_limited
 from app.services.grok.utils.response import make_response_id, make_chat_chunk, wrap_image_content
 from app.services.grok.utils.stream import wrap_stream_with_usage
+from app.services.video_seed import VideoSeedService
 from app.services.token import EffortType
 from app.services.reverse.ws_imagine import ImagineWebSocketReverse
 
@@ -551,7 +552,7 @@ class ImageWSBaseProcessor(BaseProcessor):
                 return str(match.group(1))
         return ""
 
-    def _build_video_seed(self, item: Dict[str, Any]) -> Dict[str, Any]:
+    async def _build_video_seed(self, item: Dict[str, Any]) -> Dict[str, Any]:
         image_id = str(item.get("image_id") or "")
         image_url_upstream = str(item.get("url") or "")
         parent_post_id = self._extract_parent_post_id(image_url_upstream)
@@ -567,6 +568,17 @@ class ImageWSBaseProcessor(BaseProcessor):
         }
         if parent_post_id:
             seed["parent_post_id"] = parent_post_id
+        if image_url_upstream or parent_post_id:
+            try:
+                stored = await VideoSeedService.register_seed(
+                    image_id=image_id,
+                    image_url_upstream=image_url_upstream,
+                    parent_post_id=parent_post_id,
+                    video_defaults=seed["video_defaults"],
+                )
+                seed["seed_id"] = stored["seed_id"]
+            except Exception as e:
+                logger.warning(f"Persist video_seed failed: {e}")
         return seed
 
 
@@ -801,7 +813,7 @@ class ImageWSStreamProcessor(ImageWSBaseProcessor):
                     {
                         "type": "image_generation.completed",
                         self.response_field: output,
-                        "video_seed": self._build_video_seed(item),
+                        "video_seed": await self._build_video_seed(item),
                         "created_at": int(time.time()),
                         "size": self.size,
                         "index": index,
@@ -903,7 +915,7 @@ class ImageWSCollectProcessor(ImageWSBaseProcessor):
             results.append(
                 {
                     self.response_field: output,
-                    "video_seed": self._build_video_seed(item),
+                    "video_seed": await self._build_video_seed(item),
                 }
             )
         return results

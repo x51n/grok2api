@@ -58,4 +58,4 @@ config.local.toml
 .ace-tool/
 
 # Local deploy secrets
-scripts/deploy.env
+tools/deploy/deploy.env
