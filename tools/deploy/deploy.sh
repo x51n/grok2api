@@ -128,6 +128,18 @@ container_data_mount() {
   docker inspect -f '{{range .Mounts}}{{if eq .Destination "/app/data"}}{{.Source}}{{end}}{{end}}' "$cid" 2>/dev/null || true
 }
 
+copy_data_file() {
+  source_dir="$1"
+  filename="$2"
+  source_file="${source_dir}/${filename}"
+  target_file="${DATA_DIR_HOST}/${filename}"
+
+  if [ -f "$source_file" ]; then
+    cp -f "$source_file" "$target_file"
+    COPIED=1
+  fi
+}
+
 read_nginx_port() {
   if [ -f "$REMOTE_NGINX_SITE" ]; then
     sed -n 's/.*:\(8000\|8001\).*/\1/p' "$REMOTE_NGINX_SITE" | head -n 1 || true
@@ -205,26 +217,16 @@ if [ -n "$SOURCE_PORT" ] && [ "$SOURCE_PORT" != "$TARGET_PORT" ]; then
     if [ -f "${SOURCE_PERSIST_DIR}/runtime.env" ]; then
       cp -f "${SOURCE_PERSIST_DIR}/runtime.env" "$RUNTIME_ENV_FILE"
     fi
-    if [ -f "${SOURCE_PERSIST_DIR}/data/config.toml" ]; then
-      cp -f "${SOURCE_PERSIST_DIR}/data/config.toml" "${DATA_DIR_HOST}/config.toml"
-      COPIED=1
-    fi
-    if [ -f "${SOURCE_PERSIST_DIR}/data/token.json" ]; then
-      cp -f "${SOURCE_PERSIST_DIR}/data/token.json" "${DATA_DIR_HOST}/token.json"
-      COPIED=1
-    fi
+    copy_data_file "${SOURCE_PERSIST_DIR}/data" "config.toml"
+    copy_data_file "${SOURCE_PERSIST_DIR}/data" "token.json"
+    copy_data_file "${SOURCE_PERSIST_DIR}/data" "video_seeds.json"
   fi
 
   if [ "$COPIED" -eq 0 ] && [ -n "$SOURCE_CONTAINER_DATA_DIR" ] && [ -d "$SOURCE_CONTAINER_DATA_DIR" ]; then
     log "复制旧容器配置目录: ${SOURCE_CONTAINER_DATA_DIR} -> ${DATA_DIR_HOST}"
-    if [ -f "${SOURCE_CONTAINER_DATA_DIR}/config.toml" ]; then
-      cp -f "${SOURCE_CONTAINER_DATA_DIR}/config.toml" "${DATA_DIR_HOST}/config.toml"
-      COPIED=1
-    fi
-    if [ -f "${SOURCE_CONTAINER_DATA_DIR}/token.json" ]; then
-      cp -f "${SOURCE_CONTAINER_DATA_DIR}/token.json" "${DATA_DIR_HOST}/token.json"
-      COPIED=1
-    fi
+    copy_data_file "${SOURCE_CONTAINER_DATA_DIR}" "config.toml"
+    copy_data_file "${SOURCE_CONTAINER_DATA_DIR}" "token.json"
+    copy_data_file "${SOURCE_CONTAINER_DATA_DIR}" "video_seeds.json"
   fi
 
   if [ "$COPIED" -eq 0 ]; then
@@ -268,7 +270,7 @@ fi
 
 log "等待服务启动"
 ATTEMPT=0
-until http_check "http://127.0.0.1:${TARGET_PORT}/admin"; do
+until http_check "http://127.0.0.1:${TARGET_PORT}/health"; do
   ATTEMPT=$((ATTEMPT + 1))
   if [ "$ATTEMPT" -ge 30 ]; then
     log "新容器健康检查失败，输出最近日志"
@@ -295,6 +297,14 @@ else
 fi
 
 printf '%s\n' "$TARGET_PORT" > "${REMOTE_APP_DIR}/.active_port"
+
+if [ -n "$SOURCE_CONTAINER_ID" ] && [ "$SOURCE_PORT" != "$TARGET_PORT" ]; then
+  log "停止旧容器 ${SOURCE_CONTAINER_ID}"
+  if ! docker stop "$SOURCE_CONTAINER_ID" >/dev/null; then
+    log "停止旧容器失败，已忽略"
+  fi
+fi
+
 log "部署完成，当前生效端口: ${TARGET_PORT}"
 REMOTE_EOF
 
