@@ -877,7 +877,6 @@ class VideoService:
 
         target_length = int(video_length or 6)
         round_plan = _build_round_plan(target_length, is_super=is_super_pool)
-        total_rounds = len(round_plan)
 
         service = VideoService()
         message = _build_message(prompt, preset)

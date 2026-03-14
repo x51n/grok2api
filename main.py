@@ -39,11 +39,11 @@ from app.api.v1.files import router as files_router  # noqa: E402
 from app.api.v1.models import router as models_router  # noqa: E402
 from app.api.v1.response import router as responses_router  # noqa: E402
 from app.services.token import get_scheduler  # noqa: E402
-from app.api.v1.admin import router as admin_router
-from app.api.v1.function import router as function_router
-from app.api.pages import router as pages_router
-from fastapi.responses import RedirectResponse
-from fastapi.staticfiles import StaticFiles
+from app.api.v1.admin import router as admin_router  # noqa: E402
+from app.api.v1.function import router as function_router  # noqa: E402
+from app.api.pages import router as pages_router  # noqa: E402
+from fastapi.responses import RedirectResponse  # noqa: E402
+from fastapi.staticfiles import StaticFiles  # noqa: E402
 
 # 初始化日志
 setup_logging(
